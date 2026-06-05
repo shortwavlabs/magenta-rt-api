@@ -103,6 +103,120 @@ curl -X POST http://localhost:8000/jobs \
 
 Poll `GET /jobs/{id}` until `status` is `succeeded`. Without object storage configured, job outputs are written under `outputs/` and served by the local API.
 
+## API Call Options
+
+FastAPI also exposes generated schema docs at `http://localhost:8000/docs` while the server is running. The tables below explain the request fields in plain language.
+
+### Text Generation
+
+Use `POST /v1/audio/generations` for synchronous text-to-audio generation, or `POST /jobs` for the same request in the background.
+
+Both endpoints accept a JSON body:
+
+| Field | Type | Default | Range / values | What it does |
+| --- | --- | --- | --- | --- |
+| `model` | string | `MAGENTA_RT_DEFAULT_MODEL`, usually `mrt2_small` | `mrt2_small`, `mrt2_base`; aliases include `small`, `base`, and `google/magenta-realtime-2` | Chooses the Magenta RT 2 model size. `mrt2_small` is faster and easier to run; `mrt2_base` is higher quality but much heavier. |
+| `backend` | string or `null` | `MAGENTA_RT_BACKEND`, usually `mlxfn` | `mlxfn`, `mlx`, `jax` | Chooses the inference backend. `mlxfn` uses the exported MLX function downloaded by `mrt models download`; `mlx` builds the Python MLX model from a checkpoint; `jax` uses the JAX backend and raw checkpoint. |
+| `prompt` | string | required | non-empty text | Text style description passed through MusicCoCa. Genre, instrumentation, groove, texture, production style, and energy level usually matter more than long narrative prompts. |
+| `duration` | number | `4.0` | `> 0`, capped by `MAGENTA_RT_MAX_DURATION` and model duration limits | Output length in seconds. Internally this becomes `duration * 25` model frames at 48 kHz. |
+| `temperature` | number | `1.3` | `> 0` to `5.0` | Sampling randomness. Lower values are steadier and more conservative; higher values explore more and can become less controlled. |
+| `top_k` | integer | `40` | `0` to `1024` | Limits sampling to the most likely token choices. Smaller values are more focused; larger values allow more variety. `0` leaves the backend with the broadest allowed sampling behavior. |
+| `cfg_musiccoca` | number | `3.0` | `-1.0` to `7.0` | Classifier-free guidance strength for the text/audio style conditioning. Higher values follow the MusicCoCa style prompt more strongly. |
+| `cfg_notes` | number | `1.0` | `-1.0` to `7.0` | Guidance strength for note conditioning. The current API does not expose explicit note arrays, so this mostly controls how strongly the model treats masked note conditioning. |
+| `cfg_drums` | number | `1.0` | `-1.0` to `7.0` | Guidance strength for drum conditioning. The current API does not expose explicit drum triggers, so this mostly controls the model's masked drum-conditioning behavior. |
+| `batch_size` | integer | `1` | `1` to `MAGENTA_RT_MAX_BATCH_SIZE` | Number of independent clips to generate from the same settings. `1` returns a WAV; values above `1` return a ZIP of WAV files. |
+| `seed` | integer | `0` | `>= 0` | Seed passed to the MusicCoCa text mapper. Batch generation increments this seed for each clip, so `seed: 10` with `batch_size: 3` uses `10`, `11`, and `12`. |
+| `audio_style_weight` | number | `0.5` | `0.0` to `1.0` | Only used by audio-style endpoints. It can be included in text-generation JSON, but it has no effect unless an audio file is uploaded. |
+
+Synchronous generation returns:
+
+- `audio/wav` when `batch_size` is `1`
+- `application/zip` when `batch_size` is greater than `1`
+
+Useful response headers:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Model` | Model used for generation. |
+| `X-Backend` | Backend used for generation. |
+| `X-Sample-Rate` | Output sample rate, currently `48000`. |
+| `X-Output-Count` | Number of generated clips in the response. |
+
+### Audio Style Transfer
+
+Use `POST /v1/audio/variations` for synchronous audio-style generation, or `POST /jobs/variations` for the background version.
+
+These endpoints use `multipart/form-data`, not JSON. They accept the same generation controls as text generation, plus a required audio file:
+
+| Field | Type | Required | What it does |
+| --- | --- | --- | --- |
+| `audio` | file | yes | Source audio file to embed with MusicCoCa. WAV, MP3, FLAC, OGG, and M4A usually work if `soundfile` can decode them in your environment. |
+| `prompt` | string | yes | Text style prompt to blend with the uploaded source-audio style. |
+| `audio_style_weight` | number | no | Blend between text style and uploaded audio style. `0.0` uses only the text embedding; `1.0` uses only the uploaded-audio embedding; `0.5` blends them evenly. |
+| `model`, `backend`, `duration`, `temperature`, `top_k`, `cfg_musiccoca`, `cfg_notes`, `cfg_drums`, `batch_size`, `seed` | form fields | no | Same meaning, defaults, and validation as the JSON text-generation fields. |
+
+Example with more controls:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/variations \
+  -F audio=@loop.wav \
+  -F model=mrt2_small \
+  -F backend=mlxfn \
+  -F prompt="driving synthwave with gated drums and wide pads" \
+  -F duration=8 \
+  -F temperature=1.15 \
+  -F top_k=32 \
+  -F cfg_musiccoca=3.4 \
+  -F cfg_notes=1.0 \
+  -F cfg_drums=1.2 \
+  -F batch_size=1 \
+  -F seed=4 \
+  -F audio_style_weight=0.7 \
+  --output styled.wav
+```
+
+### Jobs
+
+Job endpoints return immediately and generate in the background. They are better for cloud deployments, long clips, batch generation, or requests that should write to local/S3-compatible storage.
+
+| Endpoint | Input | Output |
+| --- | --- | --- |
+| `POST /jobs` | Same JSON body as `/v1/audio/generations` | `202` with `id`, `status`, and `status_url`. |
+| `POST /jobs/variations` | Same multipart form as `/v1/audio/variations` | `202` with `id`, `status`, and `status_url`. |
+| `GET /jobs/{id}` | job ID in URL | Current job state and download metadata. |
+| `GET /jobs/{id}/audio` | job ID in URL | Local generated artifact, only when local storage is used and the job succeeded. |
+
+`GET /jobs/{id}` returns these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `queued`, `running`, `succeeded`, or `failed`. |
+| `mode` | `text-to-audio` or `audio-style-transfer`. |
+| `model`, `backend`, `duration`, `frames` | Effective generation settings. `frames` is the model frame count at 25 frames per second. |
+| `output_count` | Number of generated clips, available after success. |
+| `download_url` | URL for the WAV/ZIP artifact after success. Local storage points back to this API; S3/R2 can return a public or presigned URL. |
+| `download_content_type` | `audio/wav` or `application/zip` after success. |
+| `storage_backend`, `storage_key` | Where the artifact was written. |
+| `sample_rate` | Output sample rate after success. |
+| `error` | Failure detail when `status` is `failed`. |
+
+### Health
+
+`GET /health` is useful for dashboards and deployment checks.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `ok` when the server is healthy, or `error` if the last model load/generation attempt failed. |
+| `loaded` / `loaded_models` | Whether any model is loaded in memory and which backend/model pairs are loaded. |
+| `available_models` / `available_backends` | Values accepted by request options. |
+| `assets.resources_ready` | Whether shared MusicCoCa/SpectroStream files are present under `$MAGENTA_HOME/magenta-rt-v2/resources`. |
+| `assets.models` | Whether each exported `mlxfn` model is present under `$MAGENTA_HOME/magenta-rt-v2/models`. |
+| `load_error` | Last model loading error, commonly a missing `.mlxfn`, `.safetensors`, or resource file. |
+
+### Inpainting Compatibility
+
+`POST /v1/audio/inpaint` and `POST /jobs/inpaint` are present so the dashboard/API shape stays close to the Stable Audio testbench, but they return `501`. Magenta RT 2's public Python API currently exposes text/audio style conditioning, not Stable Audio-style region inpainting.
+
 ## Endpoints
 
 - `GET /health`
