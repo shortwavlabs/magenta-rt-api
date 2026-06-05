@@ -1,0 +1,33 @@
+[project]
+name = "magenta-rt-api"
+version = "0.1.0"
+description = "FastAPI server and React dashboard for Google Magenta RealTime 2."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "boto3>=1.42.0",
+    "fastapi[standard]>=0.128.0",
+    "magenta-rt[mlx]>=2.0.2",
+    "python-dotenv>=1.2.1",
+    "soundfile>=0.13.1",
+    "uvicorn[standard]>=0.35.0",
+]
+
+[project.optional-dependencies]
+jax = ["magenta-rt[jax]>=2.0.2"]
+
+[project.scripts]
+magenta-rt-api = "magenta_rt_api.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magenta_rt_api"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,15 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+*.wav
+*.mp3
+*.flac
+*.zip
+outputs/
+node_modules/
+.pnpm-store/
+ui/dist/
+*.tsbuildinfo
