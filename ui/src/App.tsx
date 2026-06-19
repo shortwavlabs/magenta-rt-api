@@ -12,6 +12,7 @@ import {
   Radio,
   RefreshCw,
   SlidersHorizontal,
+  Square,
   Upload,
   Wand2,
 } from "lucide-react";
@@ -43,9 +44,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { joinUrl, parseFilename, readApiError } from "@/lib/utils";
 
-type Mode = "text" | "variation" | "inpaint";
+type Mode = "text" | "variation" | "inpaint" | "realtime";
 type JobStatus = "queued" | "running" | "succeeded" | "failed";
 type WaveformStatus = "standby" | "rendering" | "decoding" | "decoded" | "unsupported" | "failed";
+type RealtimeStatus = "idle" | "connecting" | "streaming" | "complete" | "stopped" | "error";
+type BadgeVariant = "default" | "secondary" | "outline" | "success" | "warning" | "destructive";
 
 interface WaveformBar {
   peak: number;
@@ -126,10 +129,28 @@ interface FormState {
   batchSize: number;
   seed: number;
   audioStyleWeight: number;
+  chunkFrames: number;
+}
+
+interface RealtimeStats {
+  status: RealtimeStatus;
+  chunks: number;
+  bytes: number;
+  audioSeconds: number;
+  sampleRate: number;
+  channels: number;
+  chunkFrames: number;
+  chunkDurationSeconds: number;
+  totalFrames: number;
+  startedAt: string | null;
+  completedAt: string | null;
+  message: string | null;
 }
 
 const API_BASE_STORAGE_KEY = "magenta-rt-ui-api-base";
 const DEFAULT_API_BASE = import.meta.env.VITE_MAGENTA_RT_API_BASE_URL ?? "/api";
+const DEFAULT_SAMPLE_RATE = 48_000;
+const DEFAULT_CHANNELS = 2;
 
 const waveformLevels = [
   0.2, 0.38, 0.7, 0.48, 0.82, 0.36, 0.24, 0.62, 0.9, 0.54,
@@ -155,6 +176,7 @@ const initialForm: FormState = {
   batchSize: 1,
   seed: 0,
   audioStyleWeight: 0.55,
+  chunkFrames: 1,
 };
 
 function App() {
@@ -170,9 +192,21 @@ function App() {
   const [waveformAnalysis, setWaveformAnalysis] = useState<WaveformAnalysis | null>(null);
   const [waveformStatus, setWaveformStatus] = useState<WaveformStatus>("standby");
   const [waveformError, setWaveformError] = useState<string | null>(null);
+  const [realtimeStats, setRealtimeStats] = useState<RealtimeStats>(() => {
+    return createRealtimeStats(initialForm.chunkFrames);
+  });
+  const [realtimeWaveformBars, setRealtimeWaveformBars] =
+    useState<WaveformBar[]>(placeholderWaveformBars);
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<"sync" | "job" | "health" | null>(null);
   const artifactUrlRef = useRef<string | null>(null);
+  const realtimeSocketRef = useRef<WebSocket | null>(null);
+  const realtimeAudioContextRef = useRef<AudioContext | null>(null);
+  const realtimeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const realtimeNextPlaybackTimeRef = useRef(0);
+  const realtimeChunksRef = useRef<Float32Array[]>([]);
+  const realtimeMetaRef = useRef({ sampleRate: DEFAULT_SAMPLE_RATE, channels: DEFAULT_CHANNELS });
+  const realtimeManualStopRef = useRef(false);
 
   const availableModels = health?.available_models.length
     ? health.available_models
@@ -181,13 +215,16 @@ function App() {
     ? health.available_backends
     : ["mlxfn", "mlx", "jax"];
   const maxDuration = health?.model_duration_limits_seconds[form.model] ?? 60;
-  const canUseSourceMode = mode === "text" || sourceFile !== null;
-  const busy = busyAction !== null;
+  const canUseSourceMode = mode === "text" || mode === "realtime" || sourceFile !== null;
+  const realtimeActive =
+    realtimeStats.status === "connecting" || realtimeStats.status === "streaming";
+  const busy = busyAction !== null || realtimeActive;
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.status === "queued" || job.status === "running"),
     [jobs],
   );
-  const waveformBars = waveformAnalysis?.bars ?? placeholderWaveformBars;
+  const waveformBars =
+    mode === "realtime" ? realtimeWaveformBars : waveformAnalysis?.bars ?? placeholderWaveformBars;
 
   const updateForm = <Key extends keyof FormState>(key: Key, value: FormState[Key]) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -223,6 +260,7 @@ function App() {
       if (artifactUrlRef.current) {
         URL.revokeObjectURL(artifactUrlRef.current);
       }
+      teardownRealtimeAudio(true);
     };
   }, []);
 
@@ -285,6 +323,10 @@ function App() {
       };
     }
 
+    if (mode === "realtime") {
+      throw new Error("Realtime generation uses the WebSocket stream controls.");
+    }
+
     const data = commonFormData();
     if (mode === "variation") {
       return {
@@ -298,6 +340,292 @@ function App() {
       init: { method: "POST", body: data },
     };
   };
+
+  const startRealtime = async () => {
+    realtimeManualStopRef.current = true;
+    teardownRealtimeAudio(true);
+    realtimeChunksRef.current = [];
+    realtimeMetaRef.current = {
+      sampleRate: health?.sample_rate ?? DEFAULT_SAMPLE_RATE,
+      channels: DEFAULT_CHANNELS,
+    };
+    realtimeManualStopRef.current = false;
+    setError(null);
+    setWaveformError(null);
+    setWaveformAnalysis(null);
+    setWaveformStatus("rendering");
+    setRealtimeWaveformBars(placeholderWaveformBars);
+    setRealtimeStats({
+      ...createRealtimeStats(form.chunkFrames, health?.sample_rate ?? DEFAULT_SAMPLE_RATE),
+      status: "connecting",
+      startedAt: new Date().toISOString(),
+      message: "Opening WebSocket",
+    });
+
+    const AudioContextClass =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+    if (!AudioContextClass) {
+      const message = "This browser does not support AudioContext playback.";
+      setError(message);
+      setWaveformError(message);
+      setRealtimeStats((current) => ({ ...current, status: "error", message }));
+      return;
+    }
+
+    const audioContext = new AudioContextClass();
+    await audioContext.resume().catch(() => undefined);
+    realtimeAudioContextRef.current = audioContext;
+    realtimeNextPlaybackTimeRef.current = audioContext.currentTime + 0.12;
+
+    const socket = new WebSocket(toWebSocketUrl(apiBase, "/v1/audio/realtime"));
+    socket.binaryType = "arraybuffer";
+    realtimeSocketRef.current = socket;
+
+    socket.addEventListener("open", () => {
+      const payload = {
+        ...commonJsonPayload(),
+        type: "start",
+        batch_size: 1,
+        chunk_frames: form.chunkFrames,
+        audio_format: "f32le",
+      };
+      socket.send(JSON.stringify(payload));
+      setRealtimeStats((current) => ({ ...current, message: "Waiting for model" }));
+    });
+
+    socket.addEventListener("message", (event) => {
+      void handleRealtimeMessage(event);
+    });
+
+    socket.addEventListener("error", () => {
+      const message = "Realtime WebSocket failed.";
+      setError(message);
+      setWaveformError(message);
+      setWaveformStatus("failed");
+      setRealtimeStats((current) => ({
+        ...current,
+        status: "error",
+        completedAt: new Date().toISOString(),
+        message,
+      }));
+    });
+
+    socket.addEventListener("close", (event) => {
+      realtimeSocketRef.current = null;
+      setRealtimeStats((current) => {
+        if (
+          current.status === "complete" ||
+          current.status === "error" ||
+          current.status === "stopped"
+        ) {
+          return current;
+        }
+        const stopped = realtimeManualStopRef.current || event.code === 1000;
+        return {
+          ...current,
+          status: stopped ? "stopped" : "error",
+          completedAt: new Date().toISOString(),
+          message: stopped ? "Stopped" : event.reason || `Socket closed (${event.code})`,
+        };
+      });
+    });
+  };
+
+  const stopRealtime = () => {
+    realtimeManualStopRef.current = true;
+    if (realtimeSocketRef.current && realtimeSocketRef.current.readyState <= WebSocket.OPEN) {
+      realtimeSocketRef.current.close(1000, "stopped");
+    }
+    teardownRealtimeAudio(false);
+    setWaveformStatus("standby");
+    setRealtimeStats((current) => ({
+      ...current,
+      status: current.chunks > 0 ? "stopped" : "idle",
+      completedAt: new Date().toISOString(),
+      message: "Stopped",
+    }));
+  };
+
+  const handleRealtimeMessage = async (event: MessageEvent<string | ArrayBuffer | Blob>) => {
+    if (typeof event.data === "string") {
+      await handleRealtimeControlMessage(event.data);
+      return;
+    }
+
+    const arrayBuffer =
+      event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+    handleRealtimeAudioChunk(arrayBuffer);
+  };
+
+  const handleRealtimeControlMessage = async (rawMessage: string) => {
+    const message = JSON.parse(rawMessage) as Record<string, unknown>;
+    const messageType = typeof message.type === "string" ? message.type : "message";
+
+    if (messageType === "ready") {
+      const sampleRate = numberValue(message.sample_rate, DEFAULT_SAMPLE_RATE);
+      const channels = numberValue(message.channels, DEFAULT_CHANNELS);
+      realtimeMetaRef.current = { sampleRate, channels };
+      setRealtimeStats((current) => ({
+        ...current,
+        status: "streaming",
+        sampleRate,
+        channels,
+        chunkFrames: numberValue(message.chunk_frames, current.chunkFrames),
+        chunkDurationSeconds: numberValue(
+          message.chunk_duration_seconds,
+          current.chunkDurationSeconds,
+        ),
+        totalFrames: numberValue(message.total_frames, current.totalFrames),
+        message: "Streaming audio",
+      }));
+      return;
+    }
+
+    if (messageType === "chunk") {
+      setRealtimeStats((current) => ({
+        ...current,
+        message: `Chunk ${numberValue(message.index, current.chunks) + 1}`,
+      }));
+      return;
+    }
+
+    if (messageType === "done") {
+      setRealtimeStats((current) => ({
+        ...current,
+        status: "complete",
+        completedAt: new Date().toISOString(),
+        message: "Stream complete",
+      }));
+      await finalizeRealtimeArtifact();
+      if (realtimeSocketRef.current && realtimeSocketRef.current.readyState === WebSocket.OPEN) {
+        realtimeSocketRef.current.close(1000, "done");
+      }
+      return;
+    }
+
+    if (messageType === "error") {
+      const detail = typeof message.detail === "string" ? message.detail : JSON.stringify(message);
+      setError(detail);
+      setWaveformError(detail);
+      setWaveformStatus("failed");
+      setRealtimeStats((current) => ({
+        ...current,
+        status: "error",
+        completedAt: new Date().toISOString(),
+        message: detail,
+      }));
+    }
+  };
+
+  const handleRealtimeAudioChunk = (arrayBuffer: ArrayBuffer) => {
+    const samples = new Float32Array(arrayBuffer.slice(0));
+    const { sampleRate, channels } = realtimeMetaRef.current;
+    const audioSeconds = samples.length / Math.max(1, channels) / sampleRate;
+
+    realtimeChunksRef.current.push(samples);
+    scheduleRealtimePlayback(samples, sampleRate, channels);
+    setRealtimeWaveformBars(sampleInterleavedSamples(samples, channels, 40).bars);
+    setRealtimeStats((current) => ({
+      ...current,
+      status: "streaming",
+      chunks: current.chunks + 1,
+      bytes: current.bytes + arrayBuffer.byteLength,
+      audioSeconds: current.audioSeconds + audioSeconds,
+      message: "Receiving audio",
+    }));
+  };
+
+  const scheduleRealtimePlayback = (samples: Float32Array, sampleRate: number, channels: number) => {
+    const audioContext = realtimeAudioContextRef.current;
+    if (!audioContext || audioContext.state === "closed") {
+      return;
+    }
+
+    void audioContext.resume().catch(() => undefined);
+    const frameCount = Math.floor(samples.length / Math.max(1, channels));
+    if (frameCount === 0) {
+      return;
+    }
+
+    const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
+    for (let channel = 0; channel < channels; channel += 1) {
+      const channelData = audioBuffer.getChannelData(channel);
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        channelData[frame] = samples[frame * channels + channel] ?? 0;
+      }
+    }
+
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioContext.destination);
+    source.onended = () => {
+      realtimeSourcesRef.current = realtimeSourcesRef.current.filter((entry) => entry !== source);
+    };
+
+    const startAt = Math.max(audioContext.currentTime + 0.04, realtimeNextPlaybackTimeRef.current);
+    source.start(startAt);
+    realtimeNextPlaybackTimeRef.current = startAt + audioBuffer.duration;
+    realtimeSourcesRef.current.push(source);
+  };
+
+  const finalizeRealtimeArtifact = async () => {
+    if (realtimeChunksRef.current.length === 0) {
+      setWaveformStatus("standby");
+      return;
+    }
+
+    const { sampleRate, channels } = realtimeMetaRef.current;
+    const blob = createPcm16WavBlob(realtimeChunksRef.current, sampleRate, channels);
+    const createdAt = new Date().toISOString();
+    const url = URL.createObjectURL(blob);
+    const filename = `magenta-rt-realtime-${compactTimestamp(createdAt)}.wav`;
+    setLocalArtifact({
+      url,
+      filename,
+      contentType: "audio/wav",
+      outputCount: 1,
+      createdAt,
+    });
+
+    try {
+      setWaveformStatus("decoding");
+      const analysis = await analyzeAudioBlob(blob);
+      setWaveformAnalysis(analysis);
+      setWaveformStatus("decoded");
+    } catch (caught) {
+      setWaveformStatus("failed");
+      setWaveformError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
+  function teardownRealtimeAudio(closeSocket: boolean) {
+    if (
+      closeSocket &&
+      realtimeSocketRef.current &&
+      realtimeSocketRef.current.readyState <= WebSocket.OPEN
+    ) {
+      realtimeSocketRef.current.close(1000, "reset");
+    }
+    realtimeSocketRef.current = null;
+
+    for (const source of realtimeSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // Already stopped sources throw in some browsers.
+      }
+    }
+    realtimeSourcesRef.current = [];
+
+    const audioContext = realtimeAudioContextRef.current;
+    realtimeAudioContextRef.current = null;
+    realtimeNextPlaybackTimeRef.current = 0;
+    if (audioContext && audioContext.state !== "closed") {
+      void audioContext.close().catch(() => undefined);
+    }
+  }
 
   const runSync = async () => {
     setBusyAction("sync");
@@ -489,7 +817,7 @@ function App() {
             </CardHeader>
             <CardContent>
               <Tabs value={mode} onValueChange={(value) => setMode(value as Mode)}>
-                <TabsList className="!grid w-full grid-cols-3">
+                <TabsList className="!grid w-full grid-cols-4">
                   <TabsTrigger value="text">
                     <Wand2 className="mr-1.5" />
                     <span className="block min-w-0 truncate">Text</span>
@@ -501,6 +829,10 @@ function App() {
                   <TabsTrigger value="inpaint">
                     <SlidersHorizontal className="mr-1.5" />
                     <span className="block min-w-0 truncate">Inpaint</span>
+                  </TabsTrigger>
+                  <TabsTrigger value="realtime">
+                    <Radio className="mr-1.5" />
+                    <span className="block min-w-0 truncate">Live</span>
                   </TabsTrigger>
                 </TabsList>
 
@@ -540,7 +872,7 @@ function App() {
                     </Field>
                   </div>
 
-                  {mode !== "text" ? (
+                  {mode === "variation" || mode === "inpaint" ? (
                     <Field label="Source audio">
                       <div className="flex flex-col gap-2 sm:flex-row">
                         <Input
@@ -557,7 +889,7 @@ function App() {
                     </Field>
                   ) : null}
 
-                  {mode !== "text" ? (
+                  {mode === "variation" || mode === "inpaint" ? (
                     <Field label={`Audio style weight: ${form.audioStyleWeight.toFixed(2)}`}>
                       <Input
                         type="range"
@@ -604,6 +936,16 @@ function App() {
                       step={1}
                       onChange={(value) => updateForm("seed", value)}
                     />
+                    {mode === "realtime" ? (
+                      <NumberField
+                        label="Chunk frames"
+                        value={form.chunkFrames}
+                        min={1}
+                        max={25}
+                        step={1}
+                        onChange={(value) => updateForm("chunkFrames", value)}
+                      />
+                    ) : null}
                   </div>
 
                   <details className="rounded-lg border bg-muted/30 p-4">
@@ -636,37 +978,71 @@ function App() {
                         step={0.2}
                         onChange={(value) => updateForm("cfgDrums", value)}
                       />
-                      <NumberField
-                        label="Batch"
-                        value={form.batchSize}
-                        min={1}
-                        max={health?.max_batch_size ?? 4}
-                        step={1}
-                        onChange={(value) => updateForm("batchSize", value)}
-                      />
+                      {mode === "realtime" ? (
+                        <OutputMetric label="batch" value="1 fixed for live stream" />
+                      ) : (
+                        <NumberField
+                          label="Batch"
+                          value={form.batchSize}
+                          min={1}
+                          max={health?.max_batch_size ?? 4}
+                          step={1}
+                          onChange={(value) => updateForm("batchSize", value)}
+                        />
+                      )}
                     </div>
                   </details>
 
                   <div className="flex flex-col gap-2 border-t pt-5 sm:flex-row">
-                    <Button
-                      type="button"
-                      size="lg"
-                      onClick={() => void runSync()}
-                      disabled={busy || !canUseSourceMode}
-                    >
-                      {busyAction === "sync" ? <Loader2 className="animate-spin" /> : <Play />}
-                      Generate
-                    </Button>
-                    <Button
-                      type="button"
-                      size="lg"
-                      variant="secondary"
-                      onClick={() => void startJob()}
-                      disabled={busy || !canUseSourceMode}
-                    >
-                      {busyAction === "job" ? <Loader2 className="animate-spin" /> : <Cloud />}
-                      Queue
-                    </Button>
+                    {mode === "realtime" ? (
+                      <>
+                        <Button
+                          type="button"
+                          size="lg"
+                          onClick={() => void startRealtime()}
+                          disabled={busyAction !== null || realtimeActive}
+                        >
+                          {realtimeStats.status === "connecting" ? (
+                            <Loader2 className="animate-spin" />
+                          ) : (
+                            <Play />
+                          )}
+                          Stream
+                        </Button>
+                        <Button
+                          type="button"
+                          size="lg"
+                          variant="secondary"
+                          onClick={stopRealtime}
+                          disabled={!realtimeActive}
+                        >
+                          <Square />
+                          Stop
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Button
+                          type="button"
+                          size="lg"
+                          onClick={() => void runSync()}
+                          disabled={busy || !canUseSourceMode}
+                        >
+                          {busyAction === "sync" ? <Loader2 className="animate-spin" /> : <Play />}
+                          Generate
+                        </Button>
+                        <Button
+                          type="button"
+                          size="lg"
+                          variant="secondary"
+                          onClick={() => void startJob()}
+                          disabled={busy || !canUseSourceMode}
+                        >
+                          {busyAction === "job" ? <Loader2 className="animate-spin" /> : <Cloud />}
+                          Queue
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </TabsContent>
               </Tabs>
@@ -716,8 +1092,12 @@ function App() {
                     <AudioLines className="size-4" />
                     Output
                   </CardTitle>
-                  <Badge variant={artifact ? "success" : "outline"}>
-                    {artifact ? "rendered" : "armed"}
+                  <Badge variant={outputBadgeVariant(mode, artifact, realtimeStats.status)}>
+                    {mode === "realtime"
+                      ? realtimeStatusLabel(realtimeStats.status)
+                      : artifact
+                        ? "rendered"
+                        : "armed"}
                   </Badge>
                 </div>
               </CardHeader>
@@ -729,16 +1109,23 @@ function App() {
                         sample bus
                       </div>
                       <div className="mt-1 truncate text-sm font-semibold">
-                        {artifact?.filename ?? modeLabel(mode)}
+                        {artifact?.filename ??
+                          (mode === "realtime" ? "Realtime stream" : modeLabel(mode))}
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                       <Radio className="size-3.5" />
-                      {artifact ? formatArtifactTime(artifact.createdAt) : "standby"}
+                      {mode === "realtime"
+                        ? realtimeStats.chunks > 0
+                          ? `${realtimeStats.chunks} chunks`
+                          : realtimeStatusLabel(realtimeStats.status)
+                        : artifact
+                          ? formatArtifactTime(artifact.createdAt)
+                          : "standby"}
                     </div>
                   </div>
 
-                  <div className="output-waveform">
+                  <div className={`output-waveform ${realtimeActive ? "is-live" : ""}`}>
                     <div className="output-playhead" />
                     {waveformBars.map((bar, index) => (
                       <div
@@ -755,6 +1142,8 @@ function App() {
                       </div>
                     ))}
                   </div>
+
+                  {mode === "realtime" ? <RealtimeReadout stats={realtimeStats} /> : null}
 
                   {artifact ? (
                     <div className="space-y-3">
@@ -784,7 +1173,11 @@ function App() {
                   ) : (
                     <div className="output-empty">
                       <FileAudio2 className="size-4" />
-                      <span>{waveformStatusLabel(waveformStatus)}</span>
+                      <span>
+                        {mode === "realtime"
+                          ? realtimeStatusLabel(realtimeStats.status)
+                          : waveformStatusLabel(waveformStatus)}
+                      </span>
                     </div>
                   )}
                 </div>
@@ -919,6 +1312,20 @@ function WaveformReadout({
   );
 }
 
+function RealtimeReadout({ stats }: { stats: RealtimeStats }) {
+  return (
+    <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <OutputMetric label="received" value={formatDuration(stats.audioSeconds)} />
+      <OutputMetric label="chunks" value={String(stats.chunks)} />
+      <OutputMetric
+        label="chunk"
+        value={`${stats.chunkFrames} frame${stats.chunkFrames === 1 ? "" : "s"}`}
+      />
+      <OutputMetric label="buffer" value={formatBytes(stats.bytes)} />
+    </div>
+  );
+}
+
 function StatusBadge({ status }: { status: string }) {
   if (status === "ok") {
     return (
@@ -997,7 +1404,49 @@ function modeLabel(mode: Mode) {
   if (mode === "inpaint") {
     return "Inpainting compatibility";
   }
+  if (mode === "realtime") {
+    return "Realtime WebSocket stream";
+  }
   return "Text-to-audio generation";
+}
+
+function realtimeStatusLabel(status: RealtimeStatus) {
+  if (status === "connecting") {
+    return "connecting";
+  }
+  if (status === "streaming") {
+    return "streaming";
+  }
+  if (status === "complete") {
+    return "complete";
+  }
+  if (status === "stopped") {
+    return "stopped";
+  }
+  if (status === "error") {
+    return "error";
+  }
+  return "idle";
+}
+
+function outputBadgeVariant(
+  mode: Mode,
+  artifact: LocalArtifact | null,
+  realtimeStatus: RealtimeStatus,
+): BadgeVariant {
+  if (mode !== "realtime") {
+    return artifact ? "success" : "outline";
+  }
+  if (realtimeStatus === "streaming" || realtimeStatus === "connecting") {
+    return "warning";
+  }
+  if (realtimeStatus === "complete") {
+    return "success";
+  }
+  if (realtimeStatus === "error") {
+    return "destructive";
+  }
+  return "outline";
 }
 
 function waveformStatusLabel(status: WaveformStatus) {
@@ -1048,8 +1497,57 @@ function formatDuration(seconds: number) {
   return `${minutes}:${String(Math.round(remainder)).padStart(2, "0")}`;
 }
 
+function formatBytes(bytes: number) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const kib = bytes / 1024;
+  if (kib < 1024) {
+    return `${kib.toFixed(1)} KiB`;
+  }
+  return `${(kib / 1024).toFixed(1)} MiB`;
+}
+
+function compactTimestamp(value: string) {
+  return value.replace(/\D/g, "").slice(0, 14);
+}
+
 function isAudioArtifact(contentType: string, filename: string) {
   return contentType.includes("audio") || filename.toLowerCase().endsWith(".wav");
+}
+
+function createRealtimeStats(
+  chunkFrames: number,
+  sampleRate = DEFAULT_SAMPLE_RATE,
+): RealtimeStats {
+  return {
+    status: "idle",
+    chunks: 0,
+    bytes: 0,
+    audioSeconds: 0,
+    sampleRate,
+    channels: DEFAULT_CHANNELS,
+    chunkFrames,
+    chunkDurationSeconds: chunkFrames / 25,
+    totalFrames: 0,
+    startedAt: null,
+    completedAt: null,
+    message: null,
+  };
+}
+
+function toWebSocketUrl(apiBase: string, path: string) {
+  const url = new URL(joinUrl(apiBase, path), window.location.origin);
+  if (url.protocol === "https:") {
+    url.protocol = "wss:";
+  } else if (url.protocol === "http:") {
+    url.protocol = "ws:";
+  }
+  return url.toString();
+}
+
+function numberValue(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 async function analyzeAudioBlob(blob: Blob, barCount = 40): Promise<WaveformAnalysis> {
@@ -1110,6 +1608,88 @@ function sampleAudioBuffer(audioBuffer: AudioBuffer, barCount: number): Waveform
     sampleRate: audioBuffer.sampleRate,
     channels: audioBuffer.numberOfChannels,
   };
+}
+
+function sampleInterleavedSamples(
+  samples: Float32Array,
+  channels: number,
+  barCount: number,
+): WaveformAnalysis {
+  const frameCount = Math.floor(samples.length / Math.max(1, channels));
+  const rawBars: WaveformBar[] = [];
+  let maxPeak = 0;
+
+  for (let index = 0; index < barCount; index += 1) {
+    const start = Math.floor((index * frameCount) / barCount);
+    const end = Math.max(start + 1, Math.floor(((index + 1) * frameCount) / barCount));
+    let peak = 0;
+    let sumSquares = 0;
+    let sampleCount = 0;
+
+    for (let frame = start; frame < end; frame += 1) {
+      for (let channel = 0; channel < channels; channel += 1) {
+        const absolute = Math.abs(samples[frame * channels + channel] ?? 0);
+        peak = Math.max(peak, absolute);
+        sumSquares += absolute * absolute;
+        sampleCount += 1;
+      }
+    }
+
+    const rms = Math.sqrt(sumSquares / Math.max(1, sampleCount));
+    maxPeak = Math.max(maxPeak, peak);
+    rawBars.push({ peak, rms });
+  }
+
+  const normalizer = maxPeak || 1;
+  return {
+    bars: rawBars.map((bar) => ({
+      peak: Math.max(0.04, Math.min(1, bar.peak / normalizer)),
+      rms: Math.max(0.03, Math.min(1, bar.rms / normalizer)),
+    })),
+    duration: frameCount / DEFAULT_SAMPLE_RATE,
+    sampleRate: DEFAULT_SAMPLE_RATE,
+    channels,
+  };
+}
+
+function createPcm16WavBlob(chunks: Float32Array[], sampleRate: number, channels: number) {
+  const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const bytesPerSample = 2;
+  const dataBytes = totalSamples * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buffer);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * bytesPerSample, true);
+  view.setUint16(32, channels * bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataBytes, true);
+
+  let offset = 44;
+  for (const chunk of chunks) {
+    for (const sample of chunk) {
+      const clipped = Math.max(-1, Math.min(1, sample));
+      const value = clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff;
+      view.setInt16(offset, value, true);
+      offset += bytesPerSample;
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
 }
 
 export default App;

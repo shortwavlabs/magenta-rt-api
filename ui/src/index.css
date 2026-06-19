@@ -147,6 +147,25 @@ select {
   box-shadow: 0 0 0 4px oklch(0.55 0.18 355 / 0.12);
 }
 
+.output-waveform.is-live .output-playhead {
+  animation: live-playhead 1.2s linear infinite;
+}
+
+@keyframes live-playhead {
+  0% {
+    left: 8%;
+    opacity: 0.45;
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    left: 92%;
+    opacity: 0.45;
+  }
+}
+
 .output-empty {
   display: flex;
   min-height: 58px;

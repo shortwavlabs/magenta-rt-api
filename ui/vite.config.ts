@@ -16,6 +16,7 @@ export default defineConfig({
       "/api": {
         target: process.env.VITE_MAGENTA_RT_PROXY_TARGET ?? "http://localhost:8000",
         changeOrigin: true,
+        ws: true,
         rewrite: (proxyPath) => proxyPath.replace(/^\/api/, ""),
       },
     },

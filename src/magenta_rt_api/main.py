@@ -15,7 +15,18 @@ from uuid import uuid4
 
 import anyio
 from dotenv import find_dotenv, load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -223,6 +234,25 @@ class GenerateAudioRequest(BaseModel):
                 f"duration must be <= {model_limit:g}s for model {self.model!r}"
             )
         return self
+
+
+class RealtimeAudioRequest(GenerateAudioRequest):
+    batch_size: int = Field(
+        default=1,
+        ge=1,
+        le=1,
+        description="Realtime streams generate one clip per connection.",
+    )
+    chunk_frames: int = Field(
+        default=1,
+        ge=1,
+        le=25,
+        description="Model frames per WebSocket audio chunk. 1 frame is 40 ms.",
+    )
+    audio_format: Literal["f32le"] = Field(
+        default="f32le",
+        description="Binary chunk format: interleaved stereo little-endian float32.",
+    )
 
 
 class ModelAssetsResponse(BaseModel):
@@ -746,6 +776,22 @@ def _waveform_to_wav_bytes(waveform: object) -> bytes:
     return buffer.getvalue()
 
 
+def _waveform_to_f32le_bytes(waveform: object) -> tuple[bytes, int, int]:
+    import numpy as np
+
+    samples = np.asarray(waveform.samples, dtype=np.float32)
+    if samples.ndim == 1:
+        samples = samples[:, None]
+    if samples.ndim != 2:
+        raise ValueError(f"Expected waveform samples [samples, channels], got {samples.shape}")
+    if samples.shape[1] == 1:
+        samples = np.repeat(samples, 2, axis=1)
+    if samples.shape[1] != 2:
+        raise ValueError(f"Realtime streaming expects mono/stereo audio, got {samples.shape[1]}")
+    samples = np.ascontiguousarray(samples)
+    return samples.tobytes(), int(samples.shape[0]), int(samples.shape[1])
+
+
 def _generation_result_to_artifact(result: GenerationResult) -> AudioArtifact:
     wav_outputs = [_waveform_to_wav_bytes(waveform) for waveform in result.waveforms]
     if len(wav_outputs) == 1:
@@ -1156,6 +1202,143 @@ async def create_inpaint_job() -> CreateJobResponse:
             "but not Stable Audio-style inpainting."
         ),
     )
+
+
+@app.websocket("/v1/audio/realtime")
+async def stream_realtime_audio(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    try:
+        start_message = await websocket.receive_json()
+        if not isinstance(start_message, dict):
+            await websocket.send_json({"type": "error", "detail": "Start message must be a JSON object."})
+            await websocket.close(code=1003)
+            return
+
+        message_type = start_message.pop("type", "start")
+        if message_type != "start":
+            await websocket.send_json({"type": "error", "detail": "First message must have type 'start'."})
+            await websocket.close(code=1003)
+            return
+
+        try:
+            controls = RealtimeAudioRequest.model_validate(start_message)
+        except ValidationError as exc:
+            await websocket.send_json({"type": "error", "detail": exc.errors()})
+            await websocket.close(code=1008)
+            return
+
+        runtime_request = RuntimeGenerationRequest(mode="text-to-audio", controls=controls)
+        backend = controls.backend or DEFAULT_BACKEND
+        total_frames = _frames_for_duration(controls.duration)
+        chunk_frames = min(controls.chunk_frames, total_frames)
+
+        await websocket.send_json(
+            {
+                "type": "ready",
+                "model": controls.model,
+                "backend": backend,
+                "sample_rate": SAMPLE_RATE,
+                "channels": 2,
+                "audio_format": controls.audio_format,
+                "model_frame_samples": SAMPLE_RATE // FRAMES_PER_SECOND,
+                "frames_per_second": FRAMES_PER_SECOND,
+                "chunk_frames": chunk_frames,
+                "chunk_duration_seconds": chunk_frames / FRAMES_PER_SECOND,
+                "total_frames": total_frames,
+                "duration": controls.duration,
+            }
+        )
+
+        async with runtime.lock:
+            try:
+                model = await anyio.to_thread.run_sync(
+                    runtime.load_model,
+                    controls.model,
+                    backend,
+                    controls,
+                )
+                style = await anyio.to_thread.run_sync(
+                    runtime._style_embedding,
+                    model,
+                    runtime_request,
+                    controls.seed,
+                )
+            except Exception as exc:
+                await websocket.send_json(
+                    {"type": "error", "detail": _realtime_exception_detail(exc, controls.model)}
+                )
+                await websocket.close(code=1011)
+                return
+
+        state = None
+        sent_frames = 0
+        chunk_index = 0
+
+        while sent_frames < total_frames:
+            frames_this_chunk = min(chunk_frames, total_frames - sent_frames)
+
+            def generate_chunk(current_state):
+                return model.generate(
+                    style=style,
+                    cfg_musiccoca=controls.cfg_musiccoca,
+                    cfg_notes=controls.cfg_notes,
+                    cfg_drums=controls.cfg_drums,
+                    temperature=controls.temperature,
+                    top_k=controls.top_k,
+                    frames=frames_this_chunk,
+                    state=current_state,
+                )
+
+            async with runtime.lock:
+                try:
+                    waveform, state = await anyio.to_thread.run_sync(generate_chunk, state)
+                    payload, sample_count, channels = _waveform_to_f32le_bytes(waveform)
+                except Exception as exc:
+                    await websocket.send_json(
+                        {"type": "error", "detail": _realtime_exception_detail(exc, controls.model)}
+                    )
+                    await websocket.close(code=1011)
+                    return
+
+            await websocket.send_json(
+                {
+                    "type": "chunk",
+                    "index": chunk_index,
+                    "model_frames": frames_this_chunk,
+                    "samples": sample_count,
+                    "channels": channels,
+                    "start_seconds": sent_frames / FRAMES_PER_SECOND,
+                    "duration_seconds": frames_this_chunk / FRAMES_PER_SECOND,
+                    "byte_length": len(payload),
+                }
+            )
+            await websocket.send_bytes(payload)
+
+            sent_frames += frames_this_chunk
+            chunk_index += 1
+
+        await websocket.send_json(
+            {
+                "type": "done",
+                "chunks": chunk_index,
+                "model_frames": sent_frames,
+                "duration_seconds": sent_frames / FRAMES_PER_SECOND,
+            }
+        )
+        await websocket.close(code=1000)
+    except WebSocketDisconnect:
+        logger.info("Realtime audio WebSocket disconnected.")
+
+
+def _realtime_exception_detail(exc: Exception, model_name: SupportedModel) -> str:
+    if _looks_like_missing_magenta_asset(exc):
+        return (
+            "Magenta RT 2 assets are missing or incomplete. "
+            "Run `uv run mrt models init` and "
+            f"`uv run mrt models download {model_name}`."
+        )
+    return str(exc)
 
 
 @app.post("/generate", include_in_schema=False)

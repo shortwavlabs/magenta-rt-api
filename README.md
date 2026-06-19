@@ -89,6 +89,58 @@ The async version is `POST /jobs/variations`.
 
 Stable Audio-style inpainting routes are present for dashboard/API compatibility, but return `501` because Magenta RT 2's public Python API does not expose that inpainting surface.
 
+## Realtime Audio Streaming
+
+Magenta RT 2's native realtime host path is the C++ `RealtimeRunner`: it runs an inference thread at 25 model frames per second, writes 48 kHz stereo audio into lock-free ring buffers, and lets an audio callback pull arbitrary buffer sizes with `read_audio_stereo`.
+
+This API exposes a Python WebSocket stream built on the same stateful generation idea. It calls the Python model's `generate(..., state=state)` repeatedly, keeps the returned transformer state, and streams each generated chunk to the client. It is useful for browser/network clients and prototyping, but the C++ runner is still the lowest-latency path for DAW/plugin-style realtime audio.
+
+Connect to:
+
+```text
+ws://localhost:8000/v1/audio/realtime
+```
+
+Send a JSON start message first:
+
+```json
+{
+  "type": "start",
+  "model": "mrt2_small",
+  "backend": "mlxfn",
+  "prompt": "liquid drum and bass, rolling bass, glossy pads",
+  "duration": 8,
+  "chunk_frames": 1,
+  "temperature": 1.2,
+  "top_k": 40,
+  "cfg_musiccoca": 3.0,
+  "cfg_notes": 1.0,
+  "cfg_drums": 1.0,
+  "seed": 0
+}
+```
+
+The server replies with:
+
+1. A JSON `ready` message describing sample rate, channels, format, and chunk sizing.
+2. For each audio chunk, a JSON `chunk` message followed by one binary WebSocket message.
+3. A JSON `done` message when `duration` has been generated.
+
+Binary chunks are interleaved stereo little-endian float32 (`f32le`) at 48 kHz:
+
+```text
+L0, R0, L1, R1, L2, R2, ...
+```
+
+`chunk_frames` controls latency and overhead. One MRT2 frame is 1920 samples, or 40 ms at 48 kHz:
+
+| `chunk_frames` | Audio per binary chunk | Notes |
+| --- | --- | --- |
+| `1` | 40 ms | Lowest API latency, more WebSocket messages. |
+| `2` | 80 ms | Good browser default. |
+| `5` | 200 ms | Lower message overhead, less realtime-feeling. |
+| `25` | 1 second | Useful for simple clients and debugging. |
+
 ## Async Jobs
 
 ```bash
@@ -127,6 +179,15 @@ Both endpoints accept a JSON body:
 | `batch_size` | integer | `1` | `1` to `MAGENTA_RT_MAX_BATCH_SIZE` | Number of independent clips to generate from the same settings. `1` returns a WAV; values above `1` return a ZIP of WAV files. |
 | `seed` | integer | `0` | `>= 0` | Seed passed to the MusicCoCa text mapper. Batch generation increments this seed for each clip, so `seed: 10` with `batch_size: 3` uses `10`, `11`, and `12`. |
 | `audio_style_weight` | number | `0.5` | `0.0` to `1.0` | Only used by audio-style endpoints. It can be included in text-generation JSON, but it has no effect unless an audio file is uploaded. |
+
+Realtime WebSocket streams accept the same fields, with two differences:
+
+| Field | Default | Range / values | What it does |
+| --- | --- | --- | --- |
+| `chunk_frames` | `1` | `1` to `25` | Number of 40 ms MRT2 frames generated per binary WebSocket chunk. |
+| `audio_format` | `f32le` | `f32le` | Binary chunk encoding. Currently always interleaved stereo float32 little-endian. |
+
+`batch_size` is fixed to `1` for realtime streams.
 
 Synchronous generation returns:
 
@@ -227,6 +288,7 @@ Job endpoints return immediately and generate in the background. They are better
 - `POST /v1/audio/generations`
 - `POST /v1/audio/variations`
 - `POST /v1/audio/inpaint` compatibility endpoint, returns `501`
+- `WebSocket /v1/audio/realtime`
 - `POST /generate` alias for text generation
 
 ## Configuration
